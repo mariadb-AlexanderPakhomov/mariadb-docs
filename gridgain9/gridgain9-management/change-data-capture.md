@@ -132,6 +132,36 @@ The example below shows how you can start a replication created on a previous st
 cdc replication start --name <replication_name>
 ```
 
+### Live Schema Changes
+
+A replicated table can change while writers keep writing. Every source reports the shape of the rows it delivers, and the sink decides what to do with a shape it has not seen: adapt its destination table, write the rows as they are, or refuse them.
+
+The `schemaEvolution` sink parameter decides how far a sink changes its own destination table:
+
+| Value | What the sink does |
+|---|---|
+| `ADD_COLUMNS` (default) | Adds a nullable destination column for a source column the destination lacks, and keeps replicating. Rows written before the column existed stay valid. |
+| `ADD_AND_WIDEN` | Also widens a destination column whose type the source has outgrown, for example `INT` to `BIGINT`. |
+| `NONE` | Changes nothing. A shape the destination does not already fit parks the replication. |
+
+A change the sink cannot resolve on its own puts the replication in the `SCHEMA_MISMATCH` status rather than `FAILED`:
+
+- a destination column the source stopped delivering, which the destination declares `NOT NULL` without a default;
+- a type the destination column does not accept, and that widening would not fix;
+- a change to the primary key.
+
+A parked replication is not running and keeps the position of its last written batch. `cdc replication status` names what does not fit. Repair the destination table or the source, then start the replication again: it re-checks the schemas and resumes from where it stopped, so no change is lost or applied twice. Failover leaves a parked replication alone, because another node would park on the same mismatch.
+
+Replication statuses:
+
+| Status | Meaning |
+|---|---|
+| `CREATED` | Defined, never started. |
+| `RUNNING` | Replicating. |
+| `STOPPED` | Stopped by an operator, with its position kept. |
+| `SCHEMA_MISMATCH` | Parked on a schema change nothing can resolve automatically; repair and start it again. |
+| `FAILED` | Stopped by an error. |
+
 ### Monitoring Replication
 
 You can get the list of existing replications with the `cdc replication list` command:
@@ -308,7 +338,8 @@ Sink parameters:
 | Parameter | Default | Description |
 |---|---|---|
 | targetTable | Source table name | Required in practice. Qualified name of the destination GridGain 9 table, which must differ from the source table's qualified name. If omitted, it defaults to the source table name and replication fails to start with a self-replication error. Use it to map the source table onto a differently named table, for example `dbo.ACCOUNTS` to `PUBLIC.ACCOUNTS`. |
-| unmappedFieldPolicy | `FAIL` | What happens to a source column the destination table does not have. `FAIL` refuses to start the replication. `IGNORE` drops the column from every row and keeps it once the destination table gains the column. A primary-key column is never dropped. The same policy governs the GridGain Kafka Connect sink. |
+| unmappedFieldPolicy | `FAIL` | What happens to a source column the destination table does not have and `schemaEvolution` does not add. `FAIL` refuses to start the replication. `IGNORE` drops the column from every row and keeps it once the destination table gains the column. A primary-key column is never dropped. The same policy governs the GridGain Kafka Connect sink. |
+| schemaEvolution | `ADD_COLUMNS` | How far the sink changes the destination table to follow the source: `ADD_COLUMNS` adds a nullable column for a source column the destination lacks, `ADD_AND_WIDEN` also widens a destination column the source has outgrown, `NONE` changes nothing. See [Live Schema Changes](#live-schema-changes). |
 
 When the replication starts, the sink compares the columns of the capture instance with the destination table and fails the start with a message naming every mismatch, rather than failing on the first row: a column the destination lacks (under `FAIL`), a primary key made of different columns, a type the destination column does not accept, a nullable source column going into a `NOT NULL` destination column, or a `NOT NULL` destination column the source does not deliver. Integer and floating-point source values are accepted by a wider destination column; a narrower one is a mismatch.
 
@@ -329,9 +360,35 @@ Both `NEW_DATA` and `ALL` modes are supported.
 
 ### Schema Changes
 
-SQL Server keeps a capture instance's column list fixed, so a schema change needs a new capture instance. SQL Server supports two capture instances per table for exactly this: the DBA creates the second instance while the first still captures, and the consumer moves from one to the other. The replication follows the same hand-over, so the source table keeps taking writes throughout and the destination table is changed when you are ready. The saved position survives the switch, because it is kept per replication and table.
+SQL Server keeps a capture instance's column list fixed, so a schema change needs a new capture instance. SQL Server supports two capture instances per table for exactly this: the DBA creates the second instance while the first still captures, and the consumer moves from one to the other. The replication follows the same hand-over, so the source table keeps taking writes throughout. The saved position survives the switch, because it is kept per replication and table.
 
-To add a column to `dbo.ACCOUNTS` replicated by the source `mssql_source` into `PUBLIC.ACCOUNTS`:
+#### Following the capture instances automatically
+
+Set the table's capture instance to `auto` and the source moves itself:
+
+```
+cdc source create --name mssql_source --type mssql --tables dbo.ACCOUNTS \
+  --parameters jdbcUrl="jdbc:sqlserver://localhost:1433;databaseName=testdb;encrypt=true;trustServerCertificate=true" \
+  --parameters user=replicator --parameters password=<password> \
+  --parameters captureInstance.dbo.ACCOUNTS=auto
+```
+
+The source reads the instance SQL Server created last, and switches to it as soon as it has read far enough that the switch loses nothing: every change between its position and the new instance's start would exist only in the instance it is leaving, so it stays until its position reaches that start. Adding a column then needs two statements on SQL Server and nothing else:
+
+```sql
+ALTER TABLE dbo.ACCOUNTS ADD EMAIL NVARCHAR(64) NULL;
+EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'ACCOUNTS',
+    @role_name = NULL, @supports_net_changes = 0, @capture_instance = N'dbo_ACCOUNTS_v2';
+GRANT SELECT ON cdc.fn_cdc_get_all_changes_dbo_ACCOUNTS_v2 TO replicator;
+```
+
+With the default `schemaEvolution=ADD_COLUMNS` the sink adds `EMAIL` to the destination table as the rows that carry it arrive, and the replication never leaves `RUNNING`: no stop, no parameter change, no start. Drop the first capture instance once nothing reads it.
+
+A change the sink cannot follow, such as a type the destination column does not accept, parks the replication in `SCHEMA_MISMATCH` instead; see [Live Schema Changes](#live-schema-changes).
+
+#### Switching capture instances by hand
+
+Name the instance instead of `auto` to decide the moment of the switch yourself. To add a column to `dbo.ACCOUNTS` replicated by the source `mssql_source` into `PUBLIC.ACCOUNTS`:
 
 1. Create the sink with `unmappedFieldPolicy=IGNORE`, or update it to that value, so that the new column is dropped until the destination table has it. With the default `FAIL`, step 4 refuses to start the replication until step 5 is done; do step 5 first in that case.
 2. Change the source table and create the second capture instance. Both instances capture from here on; the replication keeps reading the first one.
